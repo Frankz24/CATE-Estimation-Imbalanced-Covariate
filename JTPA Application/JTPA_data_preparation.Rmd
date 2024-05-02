@@ -1,0 +1,205 @@
+---
+title: "JTPA data exploration"
+author: "Frank Zhao"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+```{r}
+# install.packages('haven')
+library(haven)
+library(grf)
+library(tidyr)
+```
+
+```{r}
+expbif <- read_dta('jtpa_national_evaluation/Data/expbif/expbif.dta')
+```
+
+```{r}
+# replacement_earns
+earns <- read_dta('jtpa_national_evaluation/Data/replacement_files/replacement_files_stata/earns2.dta')
+
+# original earns data is WRONG!!!!!
+# earns <- read_dta('jtpa_national_evaluation/Data/analysis/analysis_stata/earns.dta')
+
+# Merge earns and expbif
+earns <- subset(earns, select = -c(bifrsp)) 
+```
+
+```{r}
+earns$total_earn <- rowSums(earns[, 1:30])
+```
+
+```{r}
+# ra_stat equivalent to treatmt
+expbif_selected <- subset(expbif, select = c(recid, site, age, hascar, hsged, yearearn, chhome, mstatmar, treatmt, white, black, hispanic, native, asian, male))
+```
+
+```{r}
+colnames(expbif_selected) <- c("recid", "site", "age", "hascar", "hsged", "yearearn", "children", "married", "treatment", "white", "black", "hispanic", "native", "asian", "male")
+```
+
+```{r}
+# merge the two data sets by recid
+earn_merged <- merge(earns, expbif_selected, by = "recid")
+```
+
+```{r}
+# check if any missing values
+missing <- is.na(earn_merged)
+any_missing <- any(missing)
+```
+
+```{r}
+columns_to_convert <- c("age", "hascar", "hsged", "yearearn", "children", "married", "treatment", "white", "black", "hispanic", "native", "asian", "male")
+# Convert specific columns to numeric
+earn_merged[columns_to_convert] <- lapply(earn_merged[columns_to_convert], as.numeric)
+str(earn_merged)
+```
+
+```{r}
+mean(earn_merged$treatment)
+```
+
+```{r}
+# save this data frame
+write.csv(earn_merged, file = "earnings_dataset.csv", row.names = FALSE)
+```
+
+```{r}
+library(dplyr)
+filtered_data <- earn_merged %>% filter(age >= 21) %>% filter(male == 0)
+
+control <- filtered_data %>% filter(treatment == 0)
+treatment <- filtered_data %>% filter(treatment == 1)
+
+control_means <- colMeans(control[,2:31])
+treatment_means <- colMeans(treatment[,2:31])
+
+groups <- split(control_means, rep(1:ceiling(length(control_means)/3), each=3, length.out=length(control_means)))
+control_means <- sapply(groups, sum)
+
+groups <- split(treatment_means, rep(1:ceiling(length(treatment_means)/3), each=3, length.out=length(treatment_means)))
+treatment_means <- sapply(groups, sum)
+
+# replicate bloom
+plot(1:10, treatment_means, type = "l", col = "blue", ylim = c(750, 2500))
+lines(1:10, control_means, col = "red")
+```
+
+
+## Analysis on earnings
+
+```{r}
+library(dplyr)
+earn_synth = read.csv("JTPA_earn_synthetic.csv")
+earn_merged <- earn_synth %>% sample_frac(0.1, replace = FALSE)
+```
+
+```{r}
+Y = earn_merged$total_earn
+# Treatment indicator (W = 1 if the subject was eligible to enroll in JTPA)
+W = earn_merged$treatment
+# Covariates
+X = cbind(
+age = earn_merged$age, high.school.diploma = earn_merged$hsged, race.white = earn_merged$white,
+children = earn_merged$children,
+married = earn_merged$married,
+male = earn_merged$male
+)
+```
+
+```{r}
+train <- sample(1:nrow(earn_merged), nrow(earn_merged) / 2)
+cs.forest = causal_forest(X[train,], Y[train], W[train], W.hat = mean(W[train]), num.trees = 200)
+# Get a doubly robust estimate for the ATE
+average_treatment_effect(cs.forest)
+# much more significant compared to the true data
+```
+
+```{r}
+tau.hat = predict(cs.forest, X)$predictions 
+summary(tau.hat)
+```
+
+```{r}
+test <- -train
+cate.hat <-  predict(cs.forest, X[test, ])$predictions
+cf.eval <- causal_forest(X[test, ], Y[test], W[test], W.hat = mean(W[test]), num.trees = 200)
+rate = rank_average_treatment_effect(cf.eval, cate.hat, q=seq(0.1, 1, by = 0.1))
+plot(rate, main = "TOC: By decreasing CATE estimates")
+```
+
+```{r}
+paste("AUTOC:", round(rate$estimate, 2), "+/-", round(1.96 * rate$std.err, 2))
+```
+
+```{r}
+cate.hat <-  predict(cs.forest, X[train, ])$predictions
+rate = rank_average_treatment_effect(cs.forest, cate.hat, q=seq(0.05, 1, by = 0.05))
+plot(rate, main = "TOC: By decreasing CATE estimates")
+```
+
+```{r}
+paste("AUTOC:", round(rate$estimate, 2), "+/-", round(1.96 * rate$std.err, 2))
+```
+
+## Replication for right-censored data
+
+```{r}
+url = paste( "https://raw.githubusercontent.com/GillesCrommen/DCC/", "748bd7f98feccad09205ee3df76df5ba740cc3d7/", "clean_dataset_JTPA.csv", sep = "")
+data = read.csv(url)
+
+# data <- subset(data, D == 1)
+# Outcome (days of unemployment observed)
+Y = data$days
+# Treatment indicator (W = 1 if the subject was eligible to enroll in JTPA)
+W = data$treatment
+# Non-censoring indicator (D = 1 means the subject had a job by the second survey)
+D = data$delta
+# Covariates
+X = cbind(
+age = data$age, high.school.diploma = data$hsged, race.white = data$white,
+children = data$children,
+married = data$married,
+male = data$male
+)
+```
+
+```{r}
+hist(Y[D == 1], main = "Histogram of Y", xlab = "") 
+hist(Y[D == 0], col = adjustcolor("red", 0.5), add = TRUE) 
+legend("topright", c("Event", "Censored"), col = c("gray", adjustcolor("red", 0.5)), lwd = 4)
+abline(v = 720, lty = 2)
+```
+
+```{r}
+W.relabeled = 1 - W
+# cs.forest = causal_forest(X, Y, W.relabeled, W.hat = mean(W.relabeled))
+cs.forest = causal_survival_forest( X, Y, W.relabeled, D, W.hat = mean(W.relabeled), horizon = 720)
+# Get a doubly robust estimate for the ATE
+average_treatment_effect(cs.forest)
+```
+
+```{r}
+tau.hat = predict(cs.forest)$predictions 
+summary(tau.hat)
+```
+
+```{r}
+rate = rank_average_treatment_effect(cs.forest, tau.hat)
+plot(rate, main = "TOC: By decreasing CATE estimates")
+```
+
+```{r}
+paste("AUTOC:", round(rate$estimate, 2), "+/-", round(1.96 * rate$std.err, 2))
+```
+
+
